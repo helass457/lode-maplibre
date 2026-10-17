@@ -32,6 +32,7 @@ MLN_IOS_PRIVATE_HEADERS = [
     "src/MLNAnnotationView_Private.h",
     "src/MLNCompassButton_Private.h",
     "src/MLNMapView_Private.h",
+    "src/MLNLodeAtmosphereLayer.h",
     "src/MLNUserLocationAnnotationView_Private.h",
     "src/MLNUserLocation_Private.h",
     "src/MLNCompactCalloutView.h",
@@ -72,6 +73,7 @@ MLN_IOS_PUBLIC_OBJCPP_OPENGL_SOURCE = [
 ]
 MLN_IOS_PUBLIC_OBJCPP_METAL_SOURCE = [
     "src/MLNMapView+Metal.mm",
+    "src/MLNLodeAtmosphereLayer.mm",
 ]
 
 MLN_PUBLIC_IOS_APP_HEADERS = [

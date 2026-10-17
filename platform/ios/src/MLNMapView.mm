@@ -1,5 +1,6 @@
 #import "MLNMapView+Impl.h"
 #import "MLNMapView_Private.h"
+#import "MLNLodeAtmosphereLayer.h"
 
 #include <mln/annotation/annotation.hpp>
 #include <mln/layermanager/layer_manager.hpp>
@@ -7123,6 +7124,10 @@ static void *windowScreenContext = &windowScreenContext;
   }
 
   self.style = [[MLNStyle alloc] initWithRawStyle:&self.mbglMap.getStyle() stylable:self];
+#if MLN_RENDER_BACKEND_METAL
+  // Lode: the space around the globe (glow and stars), on every map; it draws only while the map is a globe
+  [self.style addLayer:[[MLNLodeAtmosphereLayer alloc] initWithIdentifier:@"lode-atmosphere"]];
+#endif
   if ([self.delegate respondsToSelector:@selector(mapView:didFinishLoadingStyle:)]) {
     [self.delegate mapView:self didFinishLoadingStyle:self.style];
   }
