@@ -22,7 +22,7 @@ jobs:
         working-directory: platform/ios
         run: |
           bazel build --compilation_mode=opt --features=dead_strip,thin_lto --objc_enable_binary_stripping \
-            --//:renderer=metal //platform/ios:MapLibre.dynamic --embed_label=maplibre_ios_${{ inputs.label }}
+            --//:renderer=metal //platform/ios:MapLibre.dynamic --embed_label=maplibre_ios_7.0.${{ github.run_number }}
           cp "$(bazel info --compilation_mode=opt bazel-bin)/platform/ios/MapLibre.dynamic.xcframework.zip" "$GITHUB_WORKSPACE/MapLibre.dynamic.xcframework.zip"
       - name: License and checksum
         run: |
