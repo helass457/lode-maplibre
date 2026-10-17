@@ -1,0 +1,37 @@
+# Lode's copy of MapLibre Native: builds the iOS engine (dynamic XCFramework, Metal) and publishes it as a release
+# here. Lode's app uses it through helass457/lode-maplibre-dist (a Swift package pointing at the release).
+# Run by hand: gh workflow run lode-ios.yml --repo helass457/lode-maplibre -f label=lode-1
+name: Lode iOS engine
+on:
+  workflow_dispatch:
+    inputs:
+      label:
+        description: Release name (lode-1, lode-2, ...)
+        required: true
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build the engine (same settings as MapLibre's own iOS release)
+        working-directory: platform/ios
+        run: |
+          bazel build --compilation_mode=opt --features=dead_strip,thin_lto --objc_enable_binary_stripping \
+            --//:renderer=metal //platform/ios:MapLibre.dynamic --embed_label=maplibre_ios_${{ inputs.label }}
+          cp "$(bazel info --compilation_mode=opt bazel-bin)/platform/ios/MapLibre.dynamic.xcframework.zip" "$GITHUB_WORKSPACE/MapLibre.dynamic.xcframework.zip"
+      - name: License and checksum
+        run: |
+          chmod +w MapLibre.dynamic.xcframework.zip
+          zip MapLibre.dynamic.xcframework.zip LICENSE.md
+          swift package compute-checksum MapLibre.dynamic.xcframework.zip | tee checksum.txt
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ inputs.label }}" MapLibre.dynamic.xcframework.zip checksum.txt --target "${{ github.sha }}" \
+            --title "${{ inputs.label }}" --notes "Lode's MapLibre iOS engine, built from ${{ github.sha }}. Checksum: $(cat checksum.txt)"
