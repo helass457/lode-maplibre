@@ -127,8 +127,13 @@ typedef struct {
                       simd_make_float4((float)inv.columns[1].x, (float)inv.columns[1].y, (float)inv.columns[1].z, (float)inv.columns[1].w),
                       simd_make_float4((float)inv.columns[2].x, (float)inv.columns[2].y, (float)inv.columns[2].z, (float)inv.columns[2].w),
                       simd_make_float4((float)inv.columns[3].x, (float)inv.columns[3].y, (float)inv.columns[3].z, (float)inv.columns[3].w));
-  const CGFloat scale = mapView.contentScaleFactor > 0 ? mapView.contentScaleFactor : 1;
-  u.size = simd_make_float2((float)(context.size.width * scale), (float)(context.size.height * scale));
+  // the drawing surface in pixels: the map view's own scale is 1 (the Metal view inside it has the screen's 3), and with
+  // points here the sphere was worked out a third of its size from the top-left corner, and space was painted over
+  // the real globe everywhere else (Oct 17: "the globe goes to the top left")
+  CGSize drawable = [mapView backendResource].mtkView.drawableSize;
+  if (drawable.width <= 0 || drawable.height <= 0) drawable = CGSizeMake(context.size.width * UIScreen.mainScreen.nativeScale, context.size.height * UIScreen.mainScreen.nativeScale);
+  const CGFloat scale = context.size.width > 0 ? drawable.width / context.size.width : 1;
+  u.size = simd_make_float2((float)drawable.width, (float)drawable.height);
   u.alpha = (float)fmin(1.0, fmax(0.0, context.projectionTransition));
   u.scale = (float)scale;
   [encoder pushDebugGroup:@"Lode atmosphere"];
