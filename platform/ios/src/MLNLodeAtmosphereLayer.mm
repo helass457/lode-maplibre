@@ -63,7 +63,7 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
       float2 uv = float2(atan2(n.x, n.z) / (2.0 * M_PI_F) + 0.5, 0.5 - asin(clamp(n.y, -1.0, 1.0)) / M_PI_F);
       lit = clamp(lights.sample(smp, uv).r * 1.6, 0.0, 1.0) * smoothstep(0.0, -0.1, sunUp);
     }
-    float rim = smoothstep(0.95, 1.0, dist) * 0.2;
+    float rim = smoothstep(0.95, 1.0, dist) * 0.2 * mix(0.35, 1.0, smoothstep(-0.35, 0.45, sunUp)); // brighter on the sunlit edge
     float a = max(night + lit * (1.0 - night), rim);
     if (a <= 0.003) discard_fragment();
     float3 col = rim > night + lit ? float3(0.6, 0.78, 1.0)
@@ -71,7 +71,11 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
     return float4(col, a * u.alpha);
   }
   float g = dist - 1.0;
-  float glow = clamp(exp(-g * 12.0) * 0.5 + exp(-g * 42.0) * 0.38, 0.0, 1.0);
+  // the glow follows the sun: full on the sunlit edge of the Earth, about a third on the night edge (the point on
+  // the sphere nearest this ray tells which side it's beside)
+  float3 limb = normalize(o - dot(o, d) * d);
+  float sunSide = mix(0.35, 1.0, smoothstep(-0.35, 0.45, dot(limb, u.sun.xyz)));
+  float glow = clamp((exp(-g * 12.0) * 0.5 + exp(-g * 42.0) * 0.38) * sunSide, 0.0, 1.0);
   float3 col = mix(float3(0.010, 0.013, 0.026), float3(0.5, 0.72, 1.0), glow);
   // stars: fixed in the sky around the Earth, so they turn with the globe as you spin it (they were fixed to the
   // screen, which looked painted on, Oct 18). The sky is cut into the six faces of a cube around the Earth, each face
