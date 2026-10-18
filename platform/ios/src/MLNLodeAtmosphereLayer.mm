@@ -27,10 +27,14 @@ vertex LodeAtmoOut lodeAtmoVertex(uint vid [[vertex_id]]) {
   return o;
 }
 
+// an integer hash: the float one repeated along columns, so the stars came out in stripes (Oct 17)
 static float lodeHash(float2 p) {
-  p = fract(p * float2(123.34, 456.21));
-  p += dot(p, p + 45.32);
-  return fract(p.x * p.y);
+  uint2 q = uint2(int2(p) + int2(4096));
+  uint n = q.x * 1597334677u ^ q.y * 3812015801u;
+  n = (n ^ (n >> 16)) * 2246822519u;
+  n = (n ^ (n >> 13)) * 3266489917u;
+  n ^= n >> 16;
+  return float(n) * (1.0 / 4294967296.0);
 }
 
 fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoUniforms &u [[buffer(0)]]) {
