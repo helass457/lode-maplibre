@@ -19,6 +19,9 @@ struct LodeAtmoUniforms {
   float alpha;      // how much of it shows (the globe's projection transition)
   float scale;      // pixels per point
   float4 sun;       // xyz: toward the sun, in unit-sphere space (x 90°E, y north, z null island); w: 1 with city lights
+  float4 moonC;     // xyz: the view ray through the Moon's center on screen; w: cos of its radius as an angle
+  float4 moonSun;   // xyz: the sun as the Moon sees it, turned into that ray's frame (its real phase); w: 1 in front of the Earth
+  float4 moonNorth; // xyz: the Moon's north in that frame (its seas sit where they really are); w: how much it shows
 };
 struct LodeAtmoOut { float4 pos [[position]]; };
 
@@ -38,6 +41,39 @@ static float lodeHash(float2 p) {
   return float(n) * (1.0 / 4294967296.0);
 }
 
+// the Moon's seas on its near side: selenographic longitude, latitude (radians) and size
+constant float3 lodeSeas[8] = { float3(-0.28, 0.58, 0.20), float3(0.30, 0.49, 0.12), float3(0.54, 0.14, 0.14), float3(1.03, 0.30, 0.09),
+                                  float3(-0.99, 0.35, 0.30), float3(-0.30, -0.37, 0.13), float3(0.89, -0.14, 0.10), float3(-0.66, -0.10, 0.11) };
+
+// The Moon: a small sphere lit by the real sun, so its phase is tonight's, with its dark seas (maria) where they are
+// on the side that faces the Earth, and faint earthshine on its dark part. rgb, a (0 off it).
+static float4 lodeMoon(float3 d, constant LodeAtmoUniforms &u, float pixAng) {
+  if (u.moonNorth.w <= 0.0) return float4(0.0);
+  float3 c = u.moonC.xyz;
+  float cd = dot(d, c);
+  if (cd < u.moonC.w - 0.002) return float4(0.0);
+  float sinr = sqrt(max(1e-8, 1.0 - u.moonC.w * u.moonC.w));
+  float3 v = (d - c * cd) / sinr;
+  float len = length(v);
+  float edge = smoothstep(1.0, 1.0 - 1.5 * pixAng / sinr, len);
+  if (edge <= 0.0) return float4(0.0);
+  float3 f = -c; // the side facing us (and the Earth)
+  float3 n = v + f * sqrt(max(0.0, 1.0 - len * len));
+  float day = smoothstep(-0.04, 0.12, dot(n, u.moonSun.xyz));
+  // selenographic longitude and latitude on the near side, for the seas
+  float3 north = normalize(u.moonNorth.xyz - f * dot(u.moonNorth.xyz, f));
+  float3 east = cross(north, f);
+  float lon = atan2(dot(n, east), dot(n, f)), lat = asin(clamp(dot(n, north), -1.0, 1.0));
+  float mare = 0.0;
+  for (int i = 0; i < 8; i++) {
+    float2 q = float2((lon - lodeSeas[i].x) * cos(lat), lat - lodeSeas[i].y) / lodeSeas[i].z;
+    mare = max(mare, exp(-dot(q, q)));
+  }
+  float albedo = 0.92 - 0.34 * mare;
+  float3 col = float3(0.96, 0.95, 0.91) * albedo * day + float3(0.10, 0.12, 0.16) * albedo * (1.0 - day);
+  return float4(col, edge * u.moonNorth.w);
+}
+
 fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoUniforms &u [[buffer(0)]],
                                  texture2d<float> lights [[texture(0)]]) {
   constexpr sampler smp(filter::linear, address::repeat);
@@ -49,7 +85,10 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
   // how far apart neighboring pixels' rays point (for the stars below; taken here, where every pixel still runs)
   float pixAng = max(max(length(dfdx(d)), length(dfdy(d))), 1e-5);
   float dist = length(o - dot(o, d) * d); // how close this pixel's ray passes to the Earth's center (radius 1)
+  float4 moon = lodeMoon(d, u, pixAng);
   if (dist < 1.0) {
+    // the Moon passing in front of the Earth (behind it, the Earth hides it)
+    if (u.moonSun.w > 0.5 && moon.a > 0.0) return float4(moon.rgb, moon.a * u.alpha);
     // on the Earth: the side in darkness right now is shaded, with a soft edge between day and night (where the ray
     // first meets the sphere, its height above the sun's horizon there); a faint rim of light at the edge
     float3 p = o + (-dot(o, d) - sqrt(max(0.0, 1.0 - dist * dist))) * d;
@@ -100,6 +139,7 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
     float3 star = tint > 0.9 ? float3(1.0, 0.86, 0.7) : tint < 0.1 ? float3(0.75, 0.85, 1.0) : float3(1.0);
     col += star * lit * (1.0 - clamp(glow * 2.2, 0.0, 1.0));
   }
+  col = mix(col, moon.rgb, moon.a);
   return float4(col, u.alpha);
 }
 )METAL";
@@ -110,6 +150,9 @@ typedef struct {
   float alpha;
   float scale;
   simd_float4 sun;
+  simd_float4 moonC;
+  simd_float4 moonSun;
+  simd_float4 moonNorth;
 } LodeAtmoUniforms;
 
 // toward the sun right now, in unit-sphere space: the point where it's overhead (declination by the day of the year,
@@ -129,6 +172,47 @@ static simd_float4 LodeSunDirection(void) {
   const double lon = (-15.0 * (hours - 12.0)) * M_PI / 180.0;
   cached = simd_make_float4((float)(sin(lon) * cos(decl)), (float)sin(decl), (float)(cos(lon) * cos(decl)), 0.0f);
   return cached;
+}
+
+// toward the Moon right now, in unit-sphere space (the Astronomical Almanac's low-precision formulas, within about
+// half a degree): its ecliptic longitude and latitude, then right ascension and declination, then the longitude where
+// it's overhead from Greenwich sidereal time
+static simd_double3 LodeMoonDirection(void) {
+  static simd_double3 cached;
+  static NSTimeInterval cachedAt = 0;
+  const NSTimeInterval t = [NSDate date].timeIntervalSince1970;
+  if (t - cachedAt < 60) return cached;
+  cachedAt = t;
+  const double r = M_PI / 180.0, d = t / 86400.0 + 2440587.5 - 2451545.0;
+  const double L = 218.316 + 13.176396 * d, M = 134.963 + 13.064993 * d, F = 93.272 + 13.229350 * d;
+  const double lam = (L + 6.289 * sin(M * r)) * r, bet = 5.128 * sin(F * r) * r, eps = 23.439 * r;
+  const double x = cos(bet) * cos(lam), y = cos(eps) * cos(bet) * sin(lam) - sin(eps) * sin(bet);
+  const double z = sin(eps) * cos(bet) * sin(lam) + cos(eps) * sin(bet);
+  const double ra = atan2(y, x), dec = asin(fmax(-1.0, fmin(1.0, z)));
+  const double gmst = fmod(280.46061837 + 360.98564736629 * d, 360.0) * r;
+  const double lon = ra - gmst;
+  cached = simd_make_double3(sin(lon) * cos(dec), sin(dec), cos(lon) * cos(dec));
+  return cached;
+}
+// turns x by the rotation that takes unit vector a to unit vector b
+static simd_double3 LodeTurn(simd_double3 x, simd_double3 a, simd_double3 b) {
+  const simd_double3 v = simd_cross(a, b);
+  const double c = simd_dot(a, b);
+  if (c < -0.9999) { // opposite: half a turn about any axis square to a
+    simd_double3 ax = simd_normalize(simd_cross(a, fabs(a.y) < 0.9 ? simd_make_double3(0, 1, 0) : simd_make_double3(1, 0, 0)));
+    return 2.0 * simd_dot(ax, x) * ax - x;
+  }
+  return x * c + simd_cross(v, x) + v * (simd_dot(v, x) / (1.0 + c));
+}
+// a point in unit-sphere space -> pixels on the drawing surface, and a pixel -> its view ray
+static simd_double2 LodePx(simd_double4x4 proj, simd_double3 p, CGSize sz) {
+  const simd_double4 c = simd_mul(proj, simd_make_double4(p, 1.0));
+  return simd_make_double2((c.x / c.w + 1.0) * 0.5 * sz.width, (1.0 - c.y / c.w) * 0.5 * sz.height);
+}
+static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
+  const double nx = px.x / sz.width * 2.0 - 1.0, ny = 1.0 - px.y / sz.height * 2.0;
+  const simd_double4 a = simd_mul(inv, simd_make_double4(nx, ny, -0.5, 1.0)), b = simd_mul(inv, simd_make_double4(nx, ny, 0.5, 1.0));
+  return simd_normalize(b.xyz / b.w - a.xyz / a.w);
 }
 
 @implementation MLNLodeAtmosphereLayer {
@@ -228,6 +312,41 @@ static simd_float4 LodeSunDirection(void) {
   u.sun = LodeSunDirection();
   [self lookForLights];
   u.sun.w = _lights ? 1.0f : 0.0f;
+  // The Moon, beside the globe in the direction it really is from here, in its real phase. At its true distance (60
+  // Earths away) it would almost never be on screen, so it sits just outside the glow, kept on the screen and clear of
+  // the search sheet at the bottom; in front of the Earth or hidden behind it as it really is. Only on the whole
+  // globe: it fades out as you zoom in.
+  u.moonC = simd_make_float4(0, 0, 0, 1);
+  u.moonSun = simd_make_float4(0, 0, 0, 0);
+  u.moonNorth = simd_make_float4(0, 0, 0, 0);
+  const double moonShow = fmin(1.0, fmax(0.0, (2.6 - context.zoomLevel) / 0.6)) * u.alpha;
+  if (moonShow > 0.01) {
+    const CGSize sz = drawable;
+    const simd_double3 m = LodeMoonDirection();
+    const simd_double2 pc = LodePx(proj, simd_make_double3(0, 0, 0), sz);
+    const simd_double3 axis = LodeRay(inv, pc, sz); // from the eye toward the Earth's center
+    simd_double3 side = simd_cross(axis, simd_make_double3(0, 1, 0));
+    if (simd_length(side) < 1e-3) side = simd_cross(axis, simd_make_double3(1, 0, 0));
+    const double rpx = simd_length(LodePx(proj, simd_normalize(side), sz) - pc); // the Earth's radius on screen
+    simd_double2 dir = LodePx(proj, m * 0.6, sz) - pc;
+    dir = simd_length(dir) > 2.0 ? simd_normalize(dir) : simd_normalize(simd_make_double2(-0.6, -0.8));
+    const double mr = fmin(36.0 * scale, fmax(14.0 * scale, 0.15 * rpx));
+    const double margin = 18.0 * scale;
+    const double ax = sz.width * 0.5 - margin - mr;
+    const double ay = (dir.y > 0 ? sz.height * 0.5 - 210.0 * scale : sz.height * 0.5 - 70.0 * scale) - mr;
+    const double fit = (ax > 0 && ay > 0) ? 1.0 / sqrt(pow(dir.x / ax, 2) + pow(dir.y / ay, 2)) : 0;
+    const double t = fmin(rpx * 1.32 + mr, fit);
+    if (t > 0) {
+      const simd_double2 pm = pc + dir * t;
+      const simd_double3 c = LodeRay(inv, pm, sz);
+      const double cosr = simd_dot(c, LodeRay(inv, pm + simd_make_double2(mr, 0), sz));
+      const simd_double3 sunD = simd_make_double3(u.sun.x, u.sun.y, u.sun.z);
+      const simd_double3 s2 = LodeTurn(sunD, m, c), n2 = LodeTurn(simd_make_double3(0, 1, 0), m, c);
+      u.moonC = simd_make_float4((float)c.x, (float)c.y, (float)c.z, (float)cosr);
+      u.moonSun = simd_make_float4((float)s2.x, (float)s2.y, (float)s2.z, simd_dot(m, axis) < 0 ? 1.0f : 0.0f);
+      u.moonNorth = simd_make_float4((float)n2.x, (float)n2.y, (float)n2.z, (float)moonShow);
+    }
+  }
   [encoder pushDebugGroup:@"Lode atmosphere"];
   [encoder setRenderPipelineState:_pipeline];
   [encoder setDepthStencilState:_depthStencil];
