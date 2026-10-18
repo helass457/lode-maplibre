@@ -18,7 +18,7 @@ struct LodeAtmoUniforms {
   float2 size;      // drawable size in pixels
   float alpha;      // how much of it shows (the globe's projection transition)
   float scale;      // pixels per point
-  float4 sun;       // xyz: toward the sun, in unit-sphere space (x 90°E, y north, z null island)
+  float4 sun;       // xyz: toward the sun, in unit-sphere space (x 90°E, y north, z null island); w: 1 with city lights
 };
 struct LodeAtmoOut { float4 pos [[position]]; };
 
@@ -38,7 +38,9 @@ static float lodeHash(float2 p) {
   return float(n) * (1.0 / 4294967296.0);
 }
 
-fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoUniforms &u [[buffer(0)]]) {
+fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoUniforms &u [[buffer(0)]],
+                                 texture2d<float> lights [[texture(0)]]) {
+  constexpr sampler smp(filter::linear, address::repeat);
   float2 ndc = float2(in.pos.x / u.size.x * 2.0 - 1.0, 1.0 - in.pos.y / u.size.y * 2.0);
   float4 a = u.inv * float4(ndc, -0.5, 1.0);
   float4 b = u.inv * float4(ndc, 0.5, 1.0);
@@ -49,17 +51,26 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
     // on the Earth: the side in darkness right now is shaded, with a soft edge between day and night (where the ray
     // first meets the sphere, its height above the sun's horizon there); a faint rim of light at the edge
     float3 p = o + (-dot(o, d) - sqrt(max(0.0, 1.0 - dist * dist))) * d;
-    float sunUp = dot(normalize(p), u.sun.xyz);
-    float night = smoothstep(0.08, -0.12, sunUp) * 0.55;
-    float rim = smoothstep(0.94, 1.0, dist) * 0.28;
-    float a = max(night, rim);
+    float3 n = normalize(p);
+    float sunUp = dot(n, u.sun.xyz);
+    float dark = smoothstep(0.08, -0.12, sunUp);
+    float night = dark * 0.55;
+    // city lights on the night side (NASA's Black Marble): warm, coming on as the sun goes down
+    float lit = 0.0;
+    if (u.sun.w > 0.5 && dark > 0.0) {
+      float2 uv = float2(atan2(n.x, n.z) / (2.0 * M_PI_F) + 0.5, 0.5 - asin(clamp(n.y, -1.0, 1.0)) / M_PI_F);
+      lit = clamp(lights.sample(smp, uv).r * 1.6, 0.0, 1.0) * smoothstep(0.0, -0.1, sunUp);
+    }
+    float rim = smoothstep(0.95, 1.0, dist) * 0.2;
+    float a = max(night + lit * (1.0 - night), rim);
     if (a <= 0.003) discard_fragment();
-    float3 col = rim > night ? float3(0.55, 0.74, 1.0) : float3(0.0, 0.01, 0.035);
+    float3 col = rim > night + lit ? float3(0.6, 0.78, 1.0)
+      : (float3(0.0, 0.01, 0.035) * night * (1.0 - lit) + float3(1.0, 0.83, 0.55) * lit) / max(a, 0.001);
     return float4(col, a * u.alpha);
   }
   float g = dist - 1.0;
-  float glow = clamp(exp(-g * 6.5) * 0.75 + exp(-g * 28.0) * 0.45, 0.0, 1.0);
-  float3 col = mix(float3(0.010, 0.013, 0.026), float3(0.42, 0.64, 1.0), glow);
+  float glow = clamp(exp(-g * 12.0) * 0.5 + exp(-g * 42.0) * 0.38, 0.0, 1.0);
+  float3 col = mix(float3(0.010, 0.013, 0.026), float3(0.5, 0.72, 1.0), glow);
   // stars: one at most per 4-point cell, at a random spot in it, a small round point (soft edge, varied size and
   // brightness, a few warm or cool), fading out in the glow
   float cellPx = 4.0 * u.scale;
@@ -108,6 +119,25 @@ static simd_float4 LodeSunDirection(void) {
 @implementation MLNLodeAtmosphereLayer {
   id<MTLRenderPipelineState> _pipeline;
   id<MTLDepthStencilState> _depthStencil;
+  id<MTLDevice> _device;
+  id<MTLTexture> _lights;      // the city lights, once Lode has downloaded them
+  id<MTLTexture> _noLights;    // 1×1 black, bound until then
+  NSTimeInterval _lookedAt;
+}
+
+// Lode downloads the city lights (NASA's Black Marble, 2048 × 1024 gray) to Library/Caches/lode-night-lights.jpg
+- (void)lookForLights {
+  if (_lights || !_device) return;
+  const NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+  if (now - _lookedAt < 5) return;
+  _lookedAt = now;
+  NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+  NSString *file = [caches stringByAppendingPathComponent:@"lode-night-lights.jpg"];
+  if (![[NSFileManager defaultManager] fileExistsAtPath:file]) return;
+  MTKTextureLoader *loader = [[MTKTextureLoader alloc] initWithDevice:_device];
+  NSError *error = nil;
+  _lights = [loader newTextureWithContentsOfURL:[NSURL fileURLWithPath:file] options:@{ MTKTextureLoaderOptionSRGB : @NO } error:&error];
+  if (!_lights) NSLog(@"Lode atmosphere: no city lights: %@", error);
 }
 
 - (void)didMoveToMapView:(MLNMapView *)mapView {
@@ -140,12 +170,20 @@ static simd_float4 LodeSunDirection(void) {
   ds.depthCompareFunction = MTLCompareFunctionAlways;
   ds.depthWriteEnabled = NO;
   _depthStencil = [device newDepthStencilStateWithDescriptor:ds];
+  _device = device;
+  MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1 height:1 mipmapped:NO];
+  _noLights = [device newTextureWithDescriptor:td];
+  const uint32_t black = 0xFF000000;
+  [_noLights replaceRegion:MTLRegionMake2D(0, 0, 1, 1) mipmapLevel:0 withBytes:&black bytesPerRow:4];
 #endif
 }
 
 - (void)willMoveFromMapView:(MLNMapView *)mapView {
   _pipeline = nil;
   _depthStencil = nil;
+  _lights = nil;
+  _noLights = nil;
+  _device = nil;
 }
 
 - (void)drawInMapView:(MLNMapView *)mapView withContext:(MLNStyleLayerDrawingContext)context {
@@ -173,10 +211,13 @@ static simd_float4 LodeSunDirection(void) {
   u.alpha = (float)fmin(1.0, fmax(0.0, context.projectionTransition));
   u.scale = (float)scale;
   u.sun = LodeSunDirection();
+  [self lookForLights];
+  u.sun.w = _lights ? 1.0f : 0.0f;
   [encoder pushDebugGroup:@"Lode atmosphere"];
   [encoder setRenderPipelineState:_pipeline];
   [encoder setDepthStencilState:_depthStencil];
   [encoder setFragmentBytes:&u length:sizeof(u) atIndex:0];
+  [encoder setFragmentTexture:(_lights ?: _noLights) atIndex:0];
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
   [encoder popDebugGroup];
 #endif
