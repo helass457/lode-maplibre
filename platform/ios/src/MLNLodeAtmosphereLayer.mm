@@ -8,7 +8,7 @@
 
 // One full-screen triangle. Each pixel's view ray is taken back through the globe's projection into unit-sphere space:
 // a ray that passes within 1 of the center hits the Earth (left alone, but for a faint rim of light at its edge);
-// anything else is space, lit by a glow that fades with the distance from the edge, with sparse still stars.
+// anything else is space, lit by a glow that fades with the distance from the edge, with sparse stars fixed in the sky.
 static const char *kLodeAtmosphereShader = R"METAL(
 #include <metal_stdlib>
 using namespace metal;
@@ -46,6 +46,8 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
   float4 b = u.inv * float4(ndc, 0.5, 1.0);
   float3 o = a.xyz / a.w;
   float3 d = normalize(b.xyz / b.w - o);
+  // how far apart neighboring pixels' rays point (for the stars below; taken here, where every pixel still runs)
+  float pixAng = max(max(length(dfdx(d)), length(dfdy(d))), 1e-5);
   float dist = length(o - dot(o, d) * d); // how close this pixel's ray passes to the Earth's center (radius 1)
   if (dist < 1.0) {
     // on the Earth: the side in darkness right now is shaded, with a soft edge between day and night (where the ray
@@ -71,17 +73,26 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
   float g = dist - 1.0;
   float glow = clamp(exp(-g * 12.0) * 0.5 + exp(-g * 42.0) * 0.38, 0.0, 1.0);
   float3 col = mix(float3(0.010, 0.013, 0.026), float3(0.5, 0.72, 1.0), glow);
-  // stars: one at most per 4-point cell, at a random spot in it, a small round point (soft edge, varied size and
-  // brightness, a few warm or cool), fading out in the glow
-  float cellPx = 4.0 * u.scale;
-  float2 cell = floor(in.pos.xy / cellPx);
-  float h = lodeHash(cell);
+  // stars: fixed in the sky around the Earth, so they turn with the globe as you spin it (they were fixed to the
+  // screen, which looked painted on, Oct 18). The sky is cut into the six faces of a cube around the Earth, each face
+  // into cells of about 4 points; at most one star per cell, at a random spot in it, a small round point (soft edge,
+  // varied size and brightness, a few warm or cool), fading out in the glow. The cell size is rounded to a power of
+  // two so it doesn't shimmer as the view changes.
+  float3 ad = abs(d);
+  float2 uv; float face;
+  if (ad.x >= ad.y && ad.x >= ad.z) { uv = d.yz / ad.x; face = d.x > 0.0 ? 0.0 : 1.0; }
+  else if (ad.y >= ad.z) { uv = d.xz / ad.y; face = d.y > 0.0 ? 2.0 : 3.0; }
+  else { uv = d.xy / ad.z; face = d.z > 0.0 ? 4.0 : 5.0; }
+  float cellA = exp2(round(log2(4.0 * u.scale * pixAng)));
+  float2 cell = floor(uv / cellA);
+  float2 key = cell + float2(face * 1000.0, 0.0);
+  float h = lodeHash(key);
   if (h > 0.972) {
-    float2 spot = (cell + float2(lodeHash(cell + 17.0), lodeHash(cell + 41.0)) * 0.8 + 0.1) * cellPx;
+    float2 spot = (cell + float2(lodeHash(key + 17.0), lodeHash(key + 41.0)) * 0.8 + 0.1) * cellA;
     float k = (h - 0.972) / 0.028;
     float r = (0.35 + 0.55 * k * k) * u.scale;
-    float lit = smoothstep(r, r * 0.25, length(in.pos.xy - spot)) * (0.35 + 0.65 * k);
-    float tint = lodeHash(cell + 7.0);
+    float lit = smoothstep(r, r * 0.25, length(uv - spot) / pixAng) * (0.35 + 0.65 * k);
+    float tint = lodeHash(key + 7.0);
     float3 star = tint > 0.9 ? float3(1.0, 0.86, 0.7) : tint < 0.1 ? float3(0.75, 0.85, 1.0) : float3(1.0);
     col += star * lit * (1.0 - clamp(glow * 2.2, 0.0, 1.0));
   }
