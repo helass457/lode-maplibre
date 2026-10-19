@@ -76,7 +76,7 @@ static float4 lodeMoon(float3 d, constant LodeAtmoUniforms &u, float pixAng) {
 
 fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoUniforms &u [[buffer(0)]],
                                  texture2d<float> lights [[texture(0)]]) {
-  constexpr sampler smp(filter::linear, address::repeat);
+  constexpr sampler smp(filter::linear, mip_filter::linear, address::repeat);
   float2 ndc = float2(in.pos.x / u.size.x * 2.0 - 1.0, 1.0 - in.pos.y / u.size.y * 2.0);
   float4 a = u.inv * float4(ndc, -0.5, 1.0);
   float4 b = u.inv * float4(ndc, 0.5, 1.0);
@@ -91,22 +91,34 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
     if (u.moonSun.w > 0.5 && moon.a > 0.0) return float4(moon.rgb, moon.a * u.alpha);
     // on the Earth: the side in darkness right now is shaded, with a soft edge between day and night (where the ray
     // first meets the sphere, its height above the sun's horizon there); a faint rim of light at the edge
-    float3 p = o + (-dot(o, d) - sqrt(max(0.0, 1.0 - dist * dist))) * d;
+    float tHit = -dot(o, d) - sqrt(max(0.0, 1.0 - dist * dist));
+    float3 p = o + tHit * d;
     float3 n = normalize(p);
     float sunUp = dot(n, u.sun.xyz);
     float dark = smoothstep(0.08, -0.12, sunUp);
-    float night = dark * 0.55;
-    // city lights on the night side (NASA's Black Marble): warm, coming on as the sun goes down
+    float night = dark * 0.62;
+    // city lights on the night side (NASA's Black Marble 2016, 4096 px): coming on as the sun goes down. They were a
+    // flat warm overlay and looked painted on (owner, Oct 18): now dim towns glow sodium orange and bright city cores
+    // warm white, with a soft halo around them, like photos from the space station. The detail level is worked out
+    // from the pixel's footprint on the sphere (the texture's own mip choice breaks at the date line, where u wraps).
     float lit = 0.0;
+    float3 lightCol = float3(1.0, 0.83, 0.55);
     if (u.sun.w > 0.5 && dark > 0.0) {
       float2 uv = float2(atan2(n.x, n.z) / (2.0 * M_PI_F) + 0.5, 0.5 - asin(clamp(n.y, -1.0, 1.0)) / M_PI_F);
-      lit = clamp(lights.sample(smp, uv).r * 1.6, 0.0, 1.0) * smoothstep(0.0, -0.1, sunUp);
+      float foot = pixAng * max(tHit, 1e-3) / max(dot(n, -d), 0.25);
+      float lod = max(0.0, log2(foot * float(lights.get_width()) / (2.0 * M_PI_F)));
+      float v = lights.sample(smp, uv, level(lod)).r;
+      float halo = lights.sample(smp, uv, level(lod + 2.5)).r;
+      float core = clamp(pow(v, 1.15) * 1.8, 0.0, 1.0);
+      float glowL = clamp(halo * 1.5, 0.0, 1.0) * 0.5;
+      lit = clamp(core + glowL * (1.0 - core), 0.0, 1.0) * smoothstep(0.0, -0.1, sunUp);
+      lightCol = mix(float3(1.0, 0.56, 0.22), float3(1.0, 0.91, 0.76), smoothstep(0.2, 0.85, v));
     }
     float rim = smoothstep(0.95, 1.0, dist) * 0.2 * mix(0.35, 1.0, smoothstep(-0.35, 0.45, sunUp)); // brighter on the sunlit edge
     float a = max(night + lit * (1.0 - night), rim);
     if (a <= 0.003) discard_fragment();
     float3 col = rim > night + lit ? float3(0.6, 0.78, 1.0)
-      : (float3(0.0, 0.01, 0.035) * night * (1.0 - lit) + float3(1.0, 0.83, 0.55) * lit) / max(a, 0.001);
+      : (float3(0.0, 0.01, 0.035) * night * (1.0 - lit) + lightCol * lit) / max(a, 0.001);
     return float4(col, a * u.alpha);
   }
   float g = dist - 1.0;
@@ -221,22 +233,59 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
   id<MTLDevice> _device;
   id<MTLTexture> _lights;      // the city lights, once Lode has downloaded them
   id<MTLTexture> _noLights;    // 1×1 black, bound until then
+  BOOL _lightsLoading;
   NSTimeInterval _lookedAt;
 }
 
-// Lode downloads the city lights (NASA's Black Marble, 2048 × 1024 gray) to Library/Caches/lode-night-lights.jpg
+// Lode downloads the city lights to Library/Caches: lode-night-lights-2.jpg (NASA's Black Marble 2016, 4096 × 2048 gray,
+// Oct 18) or, before that, lode-night-lights.jpg (2048 × 1024). Made into a one-channel texture with mipmaps (8 MB
+// instead of 32 as color, and smooth when the globe shrinks it), off the drawing thread.
 - (void)lookForLights {
-  if (_lights || !_device) return;
+  if (_lights || _lightsLoading || !_device) return;
   const NSTimeInterval now = [NSDate date].timeIntervalSince1970;
   if (now - _lookedAt < 5) return;
   _lookedAt = now;
   NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
-  NSString *file = [caches stringByAppendingPathComponent:@"lode-night-lights.jpg"];
+  NSString *file = [caches stringByAppendingPathComponent:@"lode-night-lights-2.jpg"];
+  if (![[NSFileManager defaultManager] fileExistsAtPath:file]) file = [caches stringByAppendingPathComponent:@"lode-night-lights.jpg"];
   if (![[NSFileManager defaultManager] fileExistsAtPath:file]) return;
-  MTKTextureLoader *loader = [[MTKTextureLoader alloc] initWithDevice:_device];
-  NSError *error = nil;
-  _lights = [loader newTextureWithContentsOfURL:[NSURL fileURLWithPath:file] options:@{ MTKTextureLoaderOptionSRGB : @NO } error:&error];
-  if (!_lights) NSLog(@"Lode atmosphere: no city lights: %@", error);
+  _lightsLoading = YES;
+  id<MTLDevice> device = _device;
+  __weak MLNLodeAtmosphereLayer *weakSelf = self;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    id<MTLTexture> tex = nil;
+    UIImage *img = [UIImage imageWithContentsOfFile:file];
+    CGImageRef cg = img.CGImage;
+    if (cg) {
+      const size_t w = CGImageGetWidth(cg), h = CGImageGetHeight(cg);
+      NSMutableData *buf = [NSMutableData dataWithLength:w * h];
+      CGColorSpaceRef gray = CGColorSpaceCreateDeviceGray();
+      CGContextRef ctx = CGBitmapContextCreate(buf.mutableBytes, w, h, 8, w, gray, kCGImageAlphaNone);
+      CGColorSpaceRelease(gray);
+      if (ctx) {
+        CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cg);
+        CGContextRelease(ctx);
+        MTLTextureDescriptor *td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm width:w height:h mipmapped:YES];
+        td.usage = MTLTextureUsageShaderRead;
+        tex = [device newTextureWithDescriptor:td];
+        [tex replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:buf.bytes bytesPerRow:w];
+        id<MTLCommandQueue> queue = [device newCommandQueue];
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+        [blit generateMipmapsForTexture:tex];
+        [blit endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+      }
+    }
+    if (!tex) NSLog(@"Lode atmosphere: no city lights from %@", file);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      MLNLodeAtmosphereLayer *me = weakSelf;
+      if (!me) return;
+      me->_lightsLoading = NO;
+      if (me->_device == device) me->_lights = tex;
+    });
+  });
 }
 
 - (void)didMoveToMapView:(MLNMapView *)mapView {
