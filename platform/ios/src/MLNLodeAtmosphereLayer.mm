@@ -22,6 +22,7 @@ struct LodeAtmoUniforms {
   float4 moonC;     // xyz: the view ray through the Moon's center on screen; w: cos of its radius as an angle
   float4 moonSun;   // xyz: the sun as the Moon sees it, turned into that ray's frame (its real phase); w: 1 in front of the Earth
   float4 moonNorth; // xyz: the Moon's north in that frame (its seas sit where they really are); w: how much it shows
+  float4 moonMore;  // x: the Moon photo's detail level for its size on screen
 };
 struct LodeAtmoOut { float4 pos [[position]]; };
 
@@ -41,13 +42,11 @@ static float lodeHash(float2 p) {
   return float(n) * (1.0 / 4294967296.0);
 }
 
-// the Moon's seas on its near side: selenographic longitude, latitude (radians) and size
-constant float3 lodeSeas[8] = { float3(-0.28, 0.58, 0.20), float3(0.30, 0.49, 0.12), float3(0.54, 0.14, 0.14), float3(1.03, 0.30, 0.09),
-                                  float3(-0.99, 0.35, 0.30), float3(-0.30, -0.37, 0.13), float3(0.89, -0.14, 0.10), float3(-0.66, -0.10, 0.11) };
-
-// The Moon: a small sphere lit by the real sun, so its phase is tonight's, with its dark seas (maria) where they are
-// on the side that faces the Earth, and faint earthshine on its dark part. rgb, a (0 off it).
-static float4 lodeMoon(float3 d, constant LodeAtmoUniforms &u, float pixAng) {
+// The Moon: NASA's photo map of it (Lunar Reconnaissance Orbiter, public domain) on a small sphere, the side that
+// faces the Earth toward us, lit by the real sun so its phase is tonight's. Lit the way the Moon is (it stays about
+// as bright to the edge, not shaded like a ball: Lommel-Seeliger), a soft terminator, and faint earthshine on the dark
+// part. It replaced a plain gray ball with painted-on seas that looked low quality (owner, Oct 18). rgb, a (0 off it).
+static float4 lodeMoon(float3 d, constant LodeAtmoUniforms &u, float pixAng, texture2d<float> photo) {
   if (u.moonNorth.w <= 0.0) return float4(0.0);
   float3 c = u.moonC.xyz;
   float cd = dot(d, c);
@@ -58,24 +57,20 @@ static float4 lodeMoon(float3 d, constant LodeAtmoUniforms &u, float pixAng) {
   float edge = smoothstep(1.0, 1.0 - 1.5 * pixAng / sinr, len);
   if (edge <= 0.0) return float4(0.0);
   float3 f = -c; // the side facing us (and the Earth)
-  float3 n = v + f * sqrt(max(0.0, 1.0 - len * len));
-  float day = smoothstep(-0.04, 0.12, dot(n, u.moonSun.xyz));
-  // selenographic longitude and latitude on the near side, for the seas
+  float3 n = normalize(v + f * sqrt(max(0.0, 1.0 - len * len)));
   float3 north = normalize(u.moonNorth.xyz - f * dot(u.moonNorth.xyz, f));
   float3 east = cross(north, f);
   float lon = atan2(dot(n, east), dot(n, f)), lat = asin(clamp(dot(n, north), -1.0, 1.0));
-  float mare = 0.0;
-  for (int i = 0; i < 8; i++) {
-    float2 q = float2((lon - lodeSeas[i].x) * cos(lat), lat - lodeSeas[i].y) / lodeSeas[i].z;
-    mare = max(mare, exp(-dot(q, q)));
-  }
-  float albedo = 0.92 - 0.34 * mare;
-  float3 col = float3(0.96, 0.95, 0.91) * albedo * day + float3(0.10, 0.12, 0.16) * albedo * (1.0 - day);
-  return float4(col, edge * u.moonNorth.w);
+  constexpr sampler msmp(filter::linear, mip_filter::linear, address::repeat);
+  float3 albedo = photo.sample(msmp, float2(lon / (2.0 * M_PI_F) + 0.5, 0.5 - lat / M_PI_F), level(u.moonMore.x)).rgb;
+  float mu0 = dot(n, u.moonSun.xyz), mu = max(dot(n, f), 0.05);
+  float sunlit = clamp(2.0 * max(mu0, 0.0) / (max(mu0, 0.0) + mu), 0.0, 1.25) * smoothstep(-0.02, 0.08, mu0);
+  float3 col = albedo * (sunlit * 1.08 + 0.045 * float3(0.8, 0.9, 1.0));
+  return float4(min(col, float3(1.0)), edge * u.moonNorth.w);
 }
 
 fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoUniforms &u [[buffer(0)]],
-                                 texture2d<float> lights [[texture(0)]]) {
+                                 texture2d<float> lights [[texture(0)]], texture2d<float> moonPhoto [[texture(1)]]) {
   constexpr sampler smp(filter::linear, mip_filter::linear, address::repeat);
   float2 ndc = float2(in.pos.x / u.size.x * 2.0 - 1.0, 1.0 - in.pos.y / u.size.y * 2.0);
   float4 a = u.inv * float4(ndc, -0.5, 1.0);
@@ -85,7 +80,7 @@ fragment float4 lodeAtmoFragment(LodeAtmoOut in [[stage_in]], constant LodeAtmoU
   // how far apart neighboring pixels' rays point (for the stars below; taken here, where every pixel still runs)
   float pixAng = max(max(length(dfdx(d)), length(dfdy(d))), 1e-5);
   float dist = length(o - dot(o, d) * d); // how close this pixel's ray passes to the Earth's center (radius 1)
-  float4 moon = lodeMoon(d, u, pixAng);
+  float4 moon = lodeMoon(d, u, pixAng, moonPhoto);
   if (dist < 1.0) {
     // the Moon passing in front of the Earth (behind it, the Earth hides it)
     if (u.moonSun.w > 0.5 && moon.a > 0.0) return float4(moon.rgb, moon.a * u.alpha);
@@ -165,6 +160,7 @@ typedef struct {
   simd_float4 moonC;
   simd_float4 moonSun;
   simd_float4 moonNorth;
+  simd_float4 moonMore;
 } LodeAtmoUniforms;
 
 // toward the sun right now, in unit-sphere space: the point where it's overhead (declination by the day of the year,
@@ -234,6 +230,9 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
   id<MTLTexture> _lights;      // the city lights, once Lode has downloaded them
   id<MTLTexture> _noLights;    // 1×1 black, bound until then
   BOOL _lightsLoading;
+  id<MTLTexture> _moon;        // NASA's Moon map, once Lode has downloaded it (no file, no Moon)
+  BOOL _moonLoading;
+  NSTimeInterval _moonLookedAt;
   NSTimeInterval _lookedAt;
 }
 
@@ -288,6 +287,33 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
   });
 }
 
+// Lode downloads the Moon's map to Library/Caches/lode-moon.jpg (2048 × 1024); the Moon shows only once it's there, so
+// the app can take it away again by deleting the file
+- (void)lookForMoon {
+  if (_moon || _moonLoading || !_device) return;
+  const NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+  if (now - _moonLookedAt < 5) return;
+  _moonLookedAt = now;
+  NSString *caches = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+  NSString *file = [caches stringByAppendingPathComponent:@"lode-moon.jpg"];
+  if (![[NSFileManager defaultManager] fileExistsAtPath:file]) return;
+  _moonLoading = YES;
+  id<MTLDevice> device = _device;
+  __weak MLNLodeAtmosphereLayer *weakSelf = self;
+  MTKTextureLoader *loader = [[MTKTextureLoader alloc] initWithDevice:device];
+  [loader newTextureWithContentsOfURL:[NSURL fileURLWithPath:file]
+                              options:@{ MTKTextureLoaderOptionSRGB : @NO, MTKTextureLoaderOptionGenerateMipmaps : @YES }
+                    completionHandler:^(id<MTLTexture> tex, NSError *error) {
+    if (!tex) NSLog(@"Lode atmosphere: no Moon: %@", error);
+    dispatch_async(dispatch_get_main_queue(), ^{
+      MLNLodeAtmosphereLayer *me = weakSelf;
+      if (!me) return;
+      me->_moonLoading = NO;
+      if (me->_device == device) me->_moon = tex;
+    });
+  }];
+}
+
 - (void)didMoveToMapView:(MLNMapView *)mapView {
 #if MLN_RENDER_BACKEND_METAL
   MLNBackendResource *resource = [mapView backendResource];
@@ -330,6 +356,7 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
   _pipeline = nil;
   _depthStencil = nil;
   _lights = nil;
+  _moon = nil;
   _noLights = nil;
   _device = nil;
 }
@@ -368,7 +395,9 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
   u.moonC = simd_make_float4(0, 0, 0, 1);
   u.moonSun = simd_make_float4(0, 0, 0, 0);
   u.moonNorth = simd_make_float4(0, 0, 0, 0);
-  const double moonShow = fmin(1.0, fmax(0.0, (2.6 - context.zoomLevel) / 0.6)) * u.alpha;
+  u.moonMore = simd_make_float4(0, 0, 0, 0);
+  [self lookForMoon];
+  const double moonShow = _moon ? fmin(1.0, fmax(0.0, (2.6 - context.zoomLevel) / 0.6)) * u.alpha : 0.0;
   if (moonShow > 0.01) {
     const CGSize sz = drawable;
     const simd_double3 m = LodeMoonDirection();
@@ -379,7 +408,7 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
     const double rpx = simd_length(LodePx(proj, simd_normalize(side), sz) - pc); // the Earth's radius on screen
     simd_double2 dir = LodePx(proj, m * 0.6, sz) - pc;
     dir = simd_length(dir) > 2.0 ? simd_normalize(dir) : simd_normalize(simd_make_double2(-0.6, -0.8));
-    const double mr = fmin(36.0 * scale, fmax(14.0 * scale, 0.15 * rpx));
+    const double mr = fmin(44.0 * scale, fmax(18.0 * scale, 0.19 * rpx));
     const double margin = 18.0 * scale;
     const double ax = sz.width * 0.5 - margin - mr;
     const double ay = (dir.y > 0 ? sz.height * 0.5 - 210.0 * scale : sz.height * 0.5 - 70.0 * scale) - mr;
@@ -394,6 +423,8 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
       u.moonC = simd_make_float4((float)c.x, (float)c.y, (float)c.z, (float)cosr);
       u.moonSun = simd_make_float4((float)s2.x, (float)s2.y, (float)s2.z, simd_dot(m, axis) < 0 ? 1.0f : 0.0f);
       u.moonNorth = simd_make_float4((float)n2.x, (float)n2.y, (float)n2.z, (float)moonShow);
+      // the photo's detail for the Moon's size: half its width (one hemisphere) across the Moon's width in pixels
+      u.moonMore.x = (float)fmax(0.0, log2((double)_moon.width * 0.5 / (2.0 * mr)));
     }
   }
   [encoder pushDebugGroup:@"Lode atmosphere"];
@@ -401,6 +432,7 @@ static simd_double3 LodeRay(simd_double4x4 inv, simd_double2 px, CGSize sz) {
   [encoder setDepthStencilState:_depthStencil];
   [encoder setFragmentBytes:&u length:sizeof(u) atIndex:0];
   [encoder setFragmentTexture:(_lights ?: _noLights) atIndex:0];
+  [encoder setFragmentTexture:(_moon ?: _noLights) atIndex:1];
   [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
   [encoder popDebugGroup];
 #endif
