@@ -4,7 +4,7 @@ name: Lode shader check
 on:
   workflow_dispatch:
   push:
-    paths: ['platform/ios/src/MLNLodeAtmosphereLayer.mm']
+    paths: ['platform/ios/src/MLNLodeAtmosphereLayer.mm', '.github/workflows/lode-shader-check.yml']
 jobs:
   metal:
     runs-on: macos-15
