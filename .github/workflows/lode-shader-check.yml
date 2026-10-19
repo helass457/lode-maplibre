@@ -1,0 +1,18 @@
+# Compiles Lode's atmosphere shader (the Metal source inside MLNLodeAtmosphereLayer.mm, built at run time on the
+# phone) so a mistake shows up here instead of as a missing atmosphere in the app.
+name: Lode shader check
+on:
+  workflow_dispatch:
+  push:
+    paths: ['platform/ios/src/MLNLodeAtmosphereLayer.mm']
+jobs:
+  metal:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+        with: { sparse-checkout: platform/ios/src }
+      - name: Compile
+        run: |
+          perl -0ne 'print $1 if /R"METAL\((.*?)\)METAL"/s' platform/ios/src/MLNLodeAtmosphereLayer.mm > lode.metal
+          wc -l lode.metal
+          xcrun -sdk iphoneos metal -std=ios-metal2.4 -c lode.metal -o lode.air
